@@ -1,0 +1,6 @@
+.env
+.cache/
+__pycache__/
+# Kuku's screenplays are confidential: never commit the input pack
+data/
+*.zip
