@@ -4,7 +4,8 @@
   python run.py --data ... --mode baseline                                    # rules only, no key
   python run.py --data ... --episodes 1-10                                    # subset
   python run.py --data ... --compare-baseline 50                              # quality experiment
-  python run.py --data ... --models gemini-3.8-flash --judge-models gemini-3-flash-preview
+  python run.py --data ... --models gemini:gemini-3-flash-preview,mistral:mistral-large-latest
+  python run.py --doctor                                                      # which keys/models work
 """
 import argparse
 import json
@@ -12,7 +13,7 @@ import os
 import sys
 
 from promo import pipeline
-from promo.llm import LLM, PRESETS
+from promo.llm import LLM
 
 
 def parse_eps(s):
@@ -30,14 +31,14 @@ def parse_eps(s):
 
 def main():
     ap = argparse.ArgumentParser(description="Find promo clips in microdrama screenplays.")
-    ap.add_argument("--data", required=True, help="folder containing the episode .txt screenplays")
+    ap.add_argument("--data", help="folder containing the episode .txt screenplays")
+    ap.add_argument("--doctor", action="store_true", help="show which providers/models are usable, then exit")
     ap.add_argument("--out", default="out", help="output folder")
     ap.add_argument("--mode", choices=["llm", "baseline"], default="llm",
                     help="llm = full pipeline; baseline = rule-based candidates, no API key needed")
     ap.add_argument("--episodes", help="subset, e.g. 1-10 or 1,5,9 (default: all)")
-    ap.add_argument("--preset", choices=list(PRESETS), help="provider preset (default from .env, else gemini)")
-    ap.add_argument("--models", help="comma-separated generator model chain (first = preferred)")
-    ap.add_argument("--judge-models", help="comma-separated judge model chain (ideally different models)")
+    ap.add_argument("--models", help="generator fail-over chain: provider:model,provider:model (first = preferred)")
+    ap.add_argument("--judge-models", help="blind-judge fail-over chain (ideally different providers)")
     ap.add_argument("--chunk", type=int, help="episodes per proposal call (default 5)")
     ap.add_argument("--rpm", type=float, help="client-side requests per minute")
     ap.add_argument("--audit-models", help="comma-separated show-aware auditor chain (default: generator chain)")
@@ -45,8 +46,12 @@ def main():
     ap.add_argument("--compare-baseline", type=int, metavar="N", default=0,
                     help="also judge N rule-based baseline clips with the same judge (quality experiment)")
     a = ap.parse_args()
-    if a.preset:
-        os.environ["LLM_PRESET"] = a.preset
+    if a.doctor:
+        import doctor
+        sys.argv = [sys.argv[0]]
+        return doctor.main()
+    if not a.data:
+        ap.error("--data is required")
     if a.chunk:
         pipeline.CHUNK = a.chunk
     split = lambda s: [x.strip() for x in s.split(",")] if s else None

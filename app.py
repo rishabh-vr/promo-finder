@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from promo import pipeline
-from promo.llm import LLM, PRESETS, LLMError, load_dotenv
+from promo.llm import LLM, PROVIDERS, LLMError, load_dotenv, provider_key
 from promo.parse import load_show
 
 st.set_page_config(page_title="Promo Finder", page_icon="🎬", layout="wide")
@@ -33,24 +33,29 @@ st.caption("Reads a microdrama's screenplays and proposes 20-60s promo clips: a 
 
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.header("Model")
-    preset = st.selectbox("Provider", list(PRESETS), index=0,
-                          help="Any OpenAI-compatible endpoint works; presets fill in the URL and default models.")
-    base, gen_chain, judge_chain = PRESETS[preset]
-    key = st.text_input("API key", type="password",
-                        help="Free Gemini key: aistudio.google.com/apikey. Used for this run only, never stored.")
-    # A server-side key (env / host secret) is used if the box is empty; it is never sent to the browser.
+    st.header("Models")
     load_dotenv()
-    if not key and os.environ.get("LLM_API_KEY"):
-        key = os.environ["LLM_API_KEY"]
-        st.caption("Using the server's configured key.")
-    gen_models = st.text_input("Generator models (fallback order)", ",".join(gen_chain))
-    judge_models = st.text_input("Blind judge models (use different ones)", ",".join(judge_chain))
-    use_audit = st.checkbox("Show-aware audit (stronger model)", value=True,
+    FREE = [p for p in ("gemini", "mistral", "openrouter", "groq", "cerebras", "github", "huggingface")]
+    keys = {}
+    with st.expander("API keys (any you have; empty = server's / skipped)", expanded=False):
+        for name in FREE:
+            server = bool(provider_key(name))
+            v = st.text_input(f"{name}" + ("  ✓ server key" if server else ""), type="password", key=f"k_{name}",
+                              help=f"Get a free key: {PROVIDERS[name].signup}. Used for this run only, never stored.")
+            if v:
+                keys[name] = v
+    # Server-side keys (env / host secrets) are used when a box is empty; they never reach the browser.
+    have = [n for n in FREE if keys.get(n) or provider_key(n)]
+    st.caption("Providers available: " + (", ".join(have) if have else "none, so only rules-only mode will work"))
+    roles = {r: LLM(r, keys=keys, cache_dir=os.path.join(tempfile.gettempdir(), "promo_cache")) for r in ("propose", "judge", "audit")}
+    with st.expander("Fail-over chains (edit to reorder)"):
+        gen_models = st.text_area("Generator", ",\n".join(roles["propose"].entries), height=110)
+        judge_models = st.text_area("Blind judge", ",\n".join(roles["judge"].entries), height=110)
+        audit_models = st.text_area("Auditor", ",\n".join(roles["audit"].entries), height=90)
+    use_audit = st.checkbox("Show-aware audit", value=True,
                             help="A second opinion that knows the whole story: catches spoilers the blind judge can't.")
-    audit_models = st.text_input("Auditor models", ",".join(gen_chain), disabled=not use_audit)
-    chunk = st.slider("Episodes per proposal call", 1, 10, pipeline.CHUNK,
-                      help="Bigger = fewer calls (free tiers allow ~20/day per model) and more cross-episode context.")
+    chunk = st.slider("Episodes per proposal request", 1, 10, pipeline.CHUNK,
+                      help="Bigger = fewer requests and more cross-episode context. Too big for a model? It is split automatically.")
     st.divider()
     st.markdown("**How it works**\n1. Parse script → timed blocks\n2. LLM proposes clips by *block id*\n"
                 "3. Code computes timestamps, enforces 20-60s, never cuts a line in half\n"
@@ -99,15 +104,15 @@ with tab_run:
         pipeline.CHUNK = chunk
         llm = judge = auditor = None
         if mode.startswith("Full"):
-            if not key:
-                st.error("Add an API key in the sidebar, or use the rules-only baseline.")
-                st.stop()
-            split = lambda s: [x.strip() for x in s.split(",") if x.strip()]
+            split = lambda s: [x.strip() for x in s.replace("\n", ",").split(",") if x.strip()]
             cache = os.path.join(tempfile.gettempdir(), "promo_cache")
-            llm = LLM("propose", split(gen_models), base_url=base, api_key=key, cache_dir=cache)
-            judge = LLM("judge", split(judge_models), base_url=base, api_key=key, cache_dir=cache)
+            llm = LLM("propose", chain=split(gen_models), keys=keys, cache_dir=cache)
+            judge = LLM("judge", chain=split(judge_models), keys=keys, cache_dir=cache)
             if use_audit:
-                auditor = LLM("audit", split(audit_models), base_url=base, api_key=key, cache_dir=cache)
+                auditor = LLM("audit", chain=split(audit_models), keys=keys, cache_dir=cache)
+            if not llm.entries or not judge.entries:
+                st.error("No usable model: add at least one API key in the sidebar, or use the rules-only baseline.")
+                st.stop()
         with st.status("Running…", expanded=True) as status:
             try:
                 rows = pipeline.run(data_dir, out_dir, "llm" if llm else "baseline", llm, judge, subset,

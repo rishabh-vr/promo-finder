@@ -13,12 +13,13 @@ import json
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable
 
 from . import baseline, prompts
 from .clips import (build_clip, clip_text, code_checks, describe, normalize_spec,
                     overlap_ratio)
-from .llm import LLM, LLMError, items_of
+from .llm import LLM, LLMError, NoModelFits, items_of
 from .parse import Episode, fmt, load_show, render_transcript
 
 W = {"hook": 0.30, "cliffhanger": 0.30, "standalone": 0.25, "spoiler": 0.15}
@@ -28,6 +29,7 @@ RANK_TOP = 20
 DEDUPE_OVERLAP = 0.4
 MAX_PER_EPISODE_TOP10 = 2
 MIN_HOOK, MIN_CLIFF = 3, 3
+WORKERS = int(os.environ.get("PROMO_WORKERS", 4))  # parallel requests (each provider is rate-limited separately)
 
 
 def story_bible(eps: list[Episode]) -> str:
@@ -41,39 +43,82 @@ def _log(cb, msg):
         cb(msg)
 
 
-# ---------------------------------------------------------------- stage 1: propose
-def propose_llm(eps: list[Episode], all_eps: list[Episode], llm: LLM, cb=None, chunk: int = CHUNK):
-    bible = story_bible(all_eps)
-    cands, errors = [], []
-    chunks = [eps[i:i + chunk] for i in range(0, len(eps), chunk)]
-    for k, ch in enumerate(chunks, 1):
-        nums = [e.ep for e in ch]
-        _log(cb, f"[propose] chunk {k}/{len(chunks)}: episodes {nums[0]}-{nums[-1]}")
-        transcripts = "\n\n".join(render_transcript(e, qualify=True) for e in ch)
-        try:
-            res = llm.chat_json(prompts.PROPOSE_SYSTEM, prompts.propose_user(bible, nums, transcripts))
-        except LLMError as e:
-            errors.append({"episodes": nums, "stage": "propose", "error": str(e)[:500]})
-            _log(cb, f"[propose]   failed: {str(e)[:160]}")
-            continue
-        for p in items_of(res, "promos"):
-            # keep the model's ids as given (e.g. "E5-B012"); build_clip normalises and validates them
-            segs = [{"episode": s.get("episode", nums[0]), "start_block": s.get("start_block"),
-                     "end_block": s.get("end_block")} for s in (p.get("segments") or []) if isinstance(s, dict)]
+# ---------------------------------------------------------------- parallel batches with auto-split
+def _call_split(batch: list, build, llm: LLM):
+    """Call the model for one batch. If no available model can take a prompt this big (e.g. only
+    small-context free tiers are left), split the batch in half and recurse, down to one item."""
+    system, user, temp = build(batch)
+    try:
+        res, model = llm.chat_json_m(system, user, temp)
+        return [(batch, res, model)], 0
+    except NoModelFits:
+        if len(batch) <= 1:
+            raise
+        mid = len(batch) // 2
+        a, sa = _call_split(batch[:mid], build, llm)
+        b, sb = _call_split(batch[mid:], build, llm)
+        return a + b, sa + sb + 1
+
+
+def run_batches(batches: list[list], build, llm: LLM, label: str, cb, what) -> tuple[list, list]:
+    """Run batches concurrently (WORKERS threads). Returns (per-batch list of (sub_batch, result,
+    model) or None if it failed, errors). Logging happens on the calling thread."""
+    results, errors = [None] * len(batches), []
+    if not batches:
+        return results, errors
+    with ThreadPoolExecutor(max_workers=max(1, min(WORKERS, len(batches)))) as ex:
+        futs = {ex.submit(_call_split, b, build, llm): i for i, b in enumerate(batches)}
+        for f in as_completed(futs):
+            i = futs[f]
             try:
-                first_ep = int(normalize_spec(segs[0])["episode"]) if segs else nums[0]
-            except (TypeError, ValueError):
-                first_ep = nums[0]
-            cands.append({
-                "source": "llm", "episode": first_ep,
-                "segments": segs,
-                "raw_segments": p.get("segments"),
-                "hook": p.get("hook", ""), "cliffhanger": p.get("cliffhanger", ""), "why": p.get("why", ""),
-                "gen_hook_strength": p.get("hook_strength"), "gen_cliff_strength": p.get("cliffhanger_strength"),
-                "context_needed": p.get("context_needed", ""),
-            })
+                parts, splits = f.result()
+                results[i] = parts
+                llm.stats["splits"] = llm.stats.get("splits", 0) + splits
+                models = ", ".join(sorted({m for _, _, m in parts}))
+                _log(cb, f"[{label}] {what(batches[i])} ✓ {models}" + (f" (split into {len(parts)})" if len(parts) > 1 else ""))
+            except LLMError as e:
+                errors.append({"stage": label, "what": what(batches[i]), "error": str(e)[:500]})
+                _log(cb, f"[{label}] {what(batches[i])} FAILED: {str(e)[:160]}")
+    return results, errors
+
+
+# ---------------------------------------------------------------- stage 1: propose
+def propose_llm(eps: list[Episode], all_eps: list[Episode], llm: LLM, cb=None, chunk: int | None = None):
+    bible = story_bible(all_eps)
+    chunk = chunk or CHUNK
+    chunks = [eps[i:i + chunk] for i in range(0, len(eps), chunk)]
+    _log(cb, f"[propose] {len(chunks)} requests ({chunk} episodes each), up to {WORKERS} in parallel")
+
+    def build(ch):
+        nums = [e.ep for e in ch]
+        transcripts = "\n\n".join(render_transcript(e, qualify=True) for e in ch)
+        return prompts.PROPOSE_SYSTEM, prompts.propose_user(bible, nums, transcripts), 0.2
+
+    what = lambda ch: f"episodes {ch[0].ep}-{ch[-1].ep}"
+    results, errors = run_batches(chunks, build, llm, "propose", cb, what)
+    cands = []
+    for parts in results:
+        for sub, res, model in parts or []:
+            nums = [e.ep for e in sub]
+            for p in items_of(res, "promos"):
+                if not isinstance(p, dict):
+                    continue
+                # keep the model's ids as given (e.g. "E5-B012"); build_clip normalises and validates them
+                segs = [{"episode": s.get("episode", nums[0]), "start_block": s.get("start_block"),
+                         "end_block": s.get("end_block")} for s in (p.get("segments") or []) if isinstance(s, dict)]
+                try:
+                    first_ep = int(normalize_spec(segs[0])["episode"]) if segs else nums[0]
+                except (TypeError, ValueError):
+                    first_ep = nums[0]
+                cands.append({
+                    "source": "llm", "episode": first_ep, "gen_model": model,
+                    "segments": segs, "raw_segments": p.get("segments"),
+                    "hook": p.get("hook", ""), "cliffhanger": p.get("cliffhanger", ""), "why": p.get("why", ""),
+                    "gen_hook_strength": p.get("hook_strength"), "gen_cliff_strength": p.get("cliffhanger_strength"),
+                    "context_needed": p.get("context_needed", ""),
+                })
     if chunks and len(errors) == len(chunks):
-        raise LLMError(f"every proposal call failed; first error: {errors[0]['error'][:300]}")
+        raise LLMError(f"every proposal request failed; first error: {errors[0]['error'][:300]}")
     return cands, errors
 
 
@@ -127,26 +172,28 @@ def validate(cands: list[dict], episodes: dict[int, Episode]):
 
 # ---------------------------------------------------------------- stage 3: judge
 def judge(cands: list[dict], episodes, llm: LLM, cb=None, label="judge") -> list[dict]:
-    errors = []
-    todo = list(cands)
-    for attempt in range(2):  # second pass picks up any clip the judge skipped
+    """Blind 'stranger' judge. Batches run in parallel; a second pass picks up any clip skipped."""
+    errors, todo = [], list(cands)
+
+    def build(batch):
+        items = [(c["id"], clip_text(episodes, c["clip"], with_times=True, scrub=True)) for c in batch]
+        return prompts.JUDGE_SYSTEM, prompts.judge_user(items), 0.0
+
+    for attempt in range(2):
+        batches = [todo[i:i + JUDGE_BATCH] for i in range(0, len(todo), JUDGE_BATCH)]
+        what = lambda b: f"clips {b[0]['id']}-{b[-1]['id']}" + (" (retry pass)" if attempt else "")
+        results, errs = run_batches(batches, build, llm, label, cb, what)
+        errors += errs
         missing = []
-        for i in range(0, len(todo), JUDGE_BATCH):
-            batch = todo[i:i + JUDGE_BATCH]
-            _log(cb, f"[{label}] clips {i + 1}-{i + len(batch)} of {len(todo)}" + (" (retry pass)" if attempt else ""))
-            items = [(c["id"], clip_text(episodes, c["clip"], with_times=True, scrub=True)) for c in batch]
-            try:
-                res = llm.chat_json(prompts.JUDGE_SYSTEM, prompts.judge_user(items), temperature=0.0)
-            except LLMError as e:
-                errors.append({"stage": label, "error": str(e)[:500]})
-                _log(cb, f"[{label}]   failed: {str(e)[:160]}")
-                continue
-            by_id = {str(r.get("id")): r for r in items_of(res, "results") if isinstance(r, dict)}
+        for batch, parts in zip(batches, results):
+            got = {}
+            for _, res, model in parts or []:
+                for r in items_of(res, "results"):
+                    if isinstance(r, dict) and all(k in r for k in ("hook", "cliffhanger", "standalone", "spoiler_risk")):
+                        got[str(r.get("id"))] = (r, model)
             for c in batch:
-                j = by_id.get(c["id"])
-                if j and all(k in j for k in ("hook", "cliffhanger", "standalone", "spoiler_risk")):
-                    c["judge"] = j
-                    c["judge_model"] = llm.model
+                if c["id"] in got:
+                    c["judge"], c["judge_model"] = got[c["id"]]
                 else:
                     missing.append(c)
         if not missing:
@@ -197,25 +244,27 @@ def qualifies(c: dict) -> bool:
 def audit(cands: list[dict], episodes, all_eps: list[Episode], llm: LLM, cb=None) -> list[dict]:
     """Second opinion from a stronger, show-aware model (it gets the story bible). Catches what a
     blind judge structurally cannot (spoilers) and damps the cheap judge's leniency."""
-    errors, bible = [], story_bible(all_eps)
-    todo = list(cands)
+    errors, bible, todo = [], story_bible(all_eps), list(cands)
+
+    def build(batch):
+        items = [(c["id"], clip_text(episodes, c["clip"], with_times=True, scrub=True), c["episode"]) for c in batch]
+        return prompts.AUDIT_SYSTEM, prompts.audit_user(bible, items), 0.0
+
     for attempt in range(2):
+        batches = [todo[i:i + AUDIT_BATCH] for i in range(0, len(todo), AUDIT_BATCH)]
+        what = lambda b: f"clips {b[0]['id']}-{b[-1]['id']}" + (" (retry pass)" if attempt else "")
+        results, errs = run_batches(batches, build, llm, "audit", cb, what)
+        errors += errs
         missing = []
-        for i in range(0, len(todo), AUDIT_BATCH):
-            batch = todo[i:i + AUDIT_BATCH]
-            _log(cb, f"[audit] clips {i + 1}-{i + len(batch)} of {len(todo)}" + (" (retry pass)" if attempt else ""))
-            items = [(c["id"], clip_text(episodes, c["clip"], with_times=True, scrub=True), c["episode"]) for c in batch]
-            try:
-                res = llm.chat_json(prompts.AUDIT_SYSTEM, prompts.audit_user(bible, items), temperature=0.0)
-            except LLMError as e:
-                errors.append({"stage": "audit", "error": str(e)[:500]})
-                _log(cb, f"[audit]   failed: {str(e)[:160]}")
-                continue
-            by_id = {str(r.get("id")): r for r in items_of(res, "results") if isinstance(r, dict)}
+        for batch, parts in zip(batches, results):
+            got = {}
+            for _, res, model in parts or []:
+                for r in items_of(res, "results"):
+                    if isinstance(r, dict) and all(k in r for k in DIMS):
+                        got[str(r.get("id"))] = (r, model)
             for c in batch:
-                r = by_id.get(c["id"])
-                if r and all(k in r for k in DIMS):
-                    c["audit"], c["audit_model"] = r, llm.model
+                if c["id"] in got:
+                    c["audit"], c["audit_model"] = got[c["id"]]
                 else:
                     missing.append(c)
         if not missing:
@@ -298,7 +347,7 @@ def _row(c: dict, episodes) -> dict:
         "context_needed": c.get("context_needed", ""), "repaired": c.get("repaired", ""),
         "score": c.get("score"),
         "gen_hook_strength": c.get("gen_hook_strength"), "gen_cliff_strength": c.get("gen_cliff_strength"),
-        "judge": c.get("judge") or {}, "judge_model": c.get("judge_model"),
+        "gen_model": c.get("gen_model"), "judge": c.get("judge") or {}, "judge_model": c.get("judge_model"),
         "audit": c.get("audit") or {}, "audit_model": c.get("audit_model"),
         "final": {k: round(v, 2) for k, v in (final_scores(c) or {}).items()},
         "checks": c.get("checks", {}), "rank_reason": c.get("rank_reason", ""),
