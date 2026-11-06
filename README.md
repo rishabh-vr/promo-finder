@@ -58,12 +58,32 @@ LLM_JUDGE_MODELS=gemini-3.1-flash-lite,gemini-flash-lite-latest
 When a model's daily quota is spent or it is overloaded, the client moves to the next model in the
 chain. Every response is cached on disk, so an interrupted run resumes for free.
 
+## Results on a 50-episode show (Kuku input pack)
+
+| | LLM pipeline | Rule baseline |
+|---|---|---|
+| Valid clips | 44 (2 of 46 proposals rejected by code) | 50 |
+| Qualify by blind judge (hook ≥3 and cliffhanger ≥3) | **70%** | 60% |
+| Blind head-to-head, same episode (43 pairs) | **23 wins** | 17 wins, 3 ties |
+| Final tiers | 19 acquisition · 10 re-engagement · 15 weak | |
+
+On spoiler risk, the blind judge and the show-aware auditor barely agree (Spearman 0.21; the blind
+judge can't see twists), while cliffhanger scores agree well (0.72). That is why spoiler risk comes from
+the auditor only.
+
 ## Cost and scale
 
-A 50-episode show (~105k tokens of script) takes ~10 proposal calls + ~10 judge calls + 1 ranking
-call ≈ **300k input / 40k output tokens**. At paid flash-tier prices that's roughly **$0.05–0.15 per
-show**, and a few minutes per show. Shows are independent, so many can run in parallel. The free tier
-(20 requests/day/model) is the only reason the prompts are batched so heavily.
+A 50-episode show (~105k tokens of script) took ~20 calls (10 proposal, 4 judge, 2 audit, 1 rationale,
+plus retries), ≈ **0.4M input / 20k output tokens**: cents per show at flash-tier prices, 9 minutes on
+the rate-limited free tier. Proposal calls are independent and could run concurrently on a paid tier.
+The free tier (20 requests/day/model) is why prompts are batched so heavily.
+
+## Deploy the app (Streamlit Community Cloud, free)
+
+1. Push this repo to GitHub.
+2. On share.streamlit.io choose **New app**, pick the repo, and set the main file to `app.py`.
+3. Optional: under **Secrets**, add `LLM_API_KEY = "..."` so visitors can run without their own key (it
+   is never sent to the browser). Without it, visitors paste their own key or use the rules-only mode.
 
 ## Repo map
 

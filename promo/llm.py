@@ -24,8 +24,9 @@ PRESETS = {
     # The judge chain is ordered differently on purpose: a different model grades the clips than
     # the one that proposed them, which reduces a model's bias toward its own picks.
     "gemini": (GEMINI,
-               ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-3.5-flash"],
-               ["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]),
+               # ordered by what proved reliable on the free tier (Nov 2026); newest models were often overloaded
+               ["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.7-flash"],
+               ["gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.6-flash"]),
     "groq": ("https://api.groq.com/openai/v1", ["llama-3.3-70b-versatile"], ["llama-3.3-70b-versatile"]),
     "openrouter": ("https://openrouter.ai/api/v1", ["meta-llama/llama-3.3-70b-instruct:free"], ["meta-llama/llama-3.3-70b-instruct:free"]),
     "anthropic": ("https://api.anthropic.com/v1", ["claude-sonnet-5-5"], ["claude-haiku-5-5"]),
