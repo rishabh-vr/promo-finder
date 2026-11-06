@@ -51,7 +51,7 @@ def main():
         now = time.time()
         for e in llm.entries:
             cool = STATE.cool.get(e)
-            status = f"cooling {int((cool[0] - now) / 60)} min: {cool[1][:70]}" if cool and cool[0] > now else "ready"
+            status = f"cooling {int((cool[0] - now) / 60)} min: " + " ".join(cool[1].split())[:60] if cool and cool[0] > now else "ready"
             print(f"    • {e:<55} {status}")
         if not llm.entries:
             print("    (none usable: add a key to .env)")
@@ -71,7 +71,7 @@ def main():
 
         with ThreadPoolExecutor(max_workers=6) as ex:
             for e, ok, dt, err in ex.map(ping, entries):
-                print(f"  {'✓' if ok else '✗'} {e:<55} {dt:5.1f}s {err[:80]}")
+                print(f"  {chr(10003) if ok else chr(10007)} {e:<55} {dt:5.1f}s " + " ".join(err.split())[:80])
 
 
 if __name__ == "__main__":

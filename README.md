@@ -50,16 +50,16 @@ screenplays ─► 1 PARSE (code) ─► 2 PROPOSE (LLM) ─► 3 VALIDATE (code
 Add any keys you have to `.env`; providers without a key are skipped. Then run `python doctor.py`
 (or `python run.py --doctor`) to see what's usable.
 
-| Provider | Free key | Best used for |
+| Provider | Free key | Used for (verified Nov 2026) |
 |---|---|---|
-| Google Gemini | https://aistudio.google.com/apikey | proposing / auditing (strongest; 20 req/day per model) |
-| Mistral | https://console.mistral.ai/api-keys | auditing (an independent second opinion), proposing |
-| OpenRouter `:free` models | https://openrouter.ai/settings/keys | back-up for every role |
-| Groq | https://console.groq.com/keys | judging (very fast, small per-request limits) |
-| Cerebras | https://cloud.cerebras.ai | judging (very fast, small context) |
-| GitHub Models | https://github.com/settings/personal-access-tokens | judging (small requests) |
-| Hugging Face | https://huggingface.co/settings/tokens | back-up |
-| Ollama (local) | https://ollama.com/download | last resort, unlimited (`OLLAMA_ENABLED=1`) |
+| Google Gemini | https://aistudio.google.com/apikey | proposing (strongest); 20 req/day **per model**, so the chain spans several Gemini models |
+| OpenRouter `:free` models | https://openrouter.ai/settings/keys | **auditing** with Nemotron 3 Ultra 550B (a different model family = independent opinion); back-up for every role |
+| Groq | https://console.groq.com/keys | **judging** (gpt-oss-120b, Qwen 3.8; ~1-3 s per call; small per-minute token limits, so big batches auto-split) |
+| Hugging Face | https://huggingface.co/settings/tokens | last-resort back-up (tiny monthly credit; use a fine-grained "Inference Providers" token) |
+| Ollama (local) | https://ollama.com/download | unlimited offline fall-back (`OLLAMA_ENABLED=1`) |
+| Mistral, Cerebras, OpenAI, Anthropic | paid | supported if you have a key (`MISTRAL_API_KEY`, etc.) |
+
+GitHub Models is not in the chains: its endpoint answered `200 OK` with no completion during testing.
 
 **How fail-over keeps runs fast:**
 - Each role (propose / judge / audit) has an ordered chain of `provider:model` entries across all

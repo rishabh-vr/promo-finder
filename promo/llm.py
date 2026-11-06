@@ -53,7 +53,7 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
              signup="https://console.mistral.ai/api-keys"),
     Provider("openrouter", "https://openrouter.ai/api/v1", ("OPENROUTER_API_KEY",), 15, 60_000, 150,
              signup="https://openrouter.ai/settings/keys"),
-    Provider("groq", "https://api.groq.com/openai/v1", ("GROQ_API_KEY",), 25, 10_000, 60,
+    Provider("groq", "https://api.groq.com/openai/v1", ("GROQ_API_KEY",), 20, 7_000, 60,
              signup="https://console.groq.com/keys"),
     Provider("cerebras", "https://api.cerebras.ai/v1", ("CEREBRAS_API_KEY",), 25, 8_000, 60,
              signup="https://cloud.cerebras.ai"),
@@ -70,27 +70,30 @@ PROVIDERS: dict[str, Provider] = {p.name: p for p in [
 
 # Default chains: strongest/most reliable first; providers without a key are skipped automatically.
 # Judge and audit lead with different providers than the generator, for independent opinions.
+# Verified live on 2026-11-06 (python doctor.py --ping). "openrouter:auto-free" expands at start-up to
+# whatever large-context free models OpenRouter lists that day, so the chain survives model churn.
 DEFAULT_CHAINS = {
     "propose": [
-        "gemini:gemini-3-flash-preview", "mistral:mistral-large-latest", "gemini:gemini-3.6-flash",
-        "gemini:gemini-3.5-flash", "openrouter:deepseek/deepseek-chat-v3-0324:free",
-        "openrouter:openai/gpt-oss-120b:free", "openrouter:meta-llama/llama-3.3-70b-instruct:free",
-        "gemini:gemini-3.8-flash", "gemini:gemini-3.7-flash", "mistral:mistral-medium-latest",
-        "huggingface:meta-llama/Llama-3.3-70B-Instruct", "groq:openai/gpt-oss-120b",
-        "groq:llama-3.3-70b-versatile", "cerebras:gpt-oss-120b", "cerebras:llama-3.3-70b",
-        "github:openai/gpt-4.1-mini", "ollama:qwen2.5:14b",
+        "gemini:gemini-3-flash-preview", "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free",
+        "gemini:gemini-3.6-flash", "gemini:gemini-3.5-flash", "openrouter:nvidia/nemotron-3.5-super-vl:free",
+        "openrouter:dots-studio/dots-3-note-preview:free", "gemini:gemini-3.8-flash", "gemini:gemini-3.7-flash",
+        "openrouter:google/gemma-4-31b-it:free", "groq:openai/gpt-oss-120b", "groq:qwen/qwen3.8-27b",
+        "openrouter:auto-free", "mistral:mistral-large-latest", "cerebras:gpt-oss-120b",
+        "huggingface:meta-llama/Llama-3.3-70B-Instruct", "ollama:qwen2.5:14b",
     ],
     "judge": [
-        "gemini:gemini-3.1-flash-lite", "groq:llama-3.3-70b-versatile", "cerebras:llama-3.3-70b",
-        "mistral:mistral-small-latest", "gemini:gemini-flash-lite-latest", "groq:openai/gpt-oss-120b",
-        "cerebras:gpt-oss-120b", "openrouter:meta-llama/llama-3.3-70b-instruct:free",
-        "github:openai/gpt-4o-mini", "gemini:gemini-3.5-flash-lite", "huggingface:meta-llama/Llama-3.3-70B-Instruct",
-        "ollama:qwen2.5:14b",
+        "gemini:gemini-3.1-flash-lite", "groq:openai/gpt-oss-120b", "groq:qwen/qwen3.8-27b",
+        "gemini:gemini-flash-lite-latest", "openrouter:nvidia/nemotron-3.5-super-vl:free",
+        "gemini:gemini-3.5-flash-lite", "groq:openai/gpt-oss-20b", "openrouter:nvidia/nemotron-3.5-lightning:free",
+        "openrouter:auto-free", "mistral:mistral-small-latest", "cerebras:gpt-oss-120b",
+        "huggingface:meta-llama/Llama-3.3-70B-Instruct", "ollama:qwen2.5:14b",
     ],
+    # auditor leads with a different model family than the generator, for an independent second opinion
     "audit": [
-        "mistral:mistral-large-latest", "gemini:gemini-3-flash-preview", "openrouter:deepseek/deepseek-chat-v3-0324:free",
-        "gemini:gemini-3.6-flash", "gemini:gemini-3.5-flash", "openrouter:openai/gpt-oss-120b:free",
-        "groq:openai/gpt-oss-120b", "cerebras:gpt-oss-120b", "github:openai/gpt-4.1-mini", "ollama:qwen2.5:14b",
+        "openrouter:nvidia/nemotron-3-ultra-550b-a55b:free", "gemini:gemini-3-flash-preview", "gemini:gemini-3.6-flash",
+        "openrouter:nvidia/nemotron-3.5-super-vl:free", "gemini:gemini-3.5-flash",
+        "openrouter:dots-studio/dots-3-note-preview:free", "groq:openai/gpt-oss-120b", "openrouter:auto-free",
+        "mistral:mistral-large-latest", "cerebras:gpt-oss-120b", "ollama:qwen2.5:14b",
     ],
 }
 DEFAULT_CHAINS["rank"] = DEFAULT_CHAINS["judge"]
@@ -240,6 +243,30 @@ def catalog(provider: str, key: str | None, cache_dir: str) -> set[str] | None:
         return ids
 
 
+def openrouter_free(cache_dir: str, min_ctx: int = 64_000, limit: int = 6) -> list[str]:
+    """Today's large-context free OpenRouter models (the free line-up changes often)."""
+    path = os.path.join(cache_dir, "openrouter_free.json")
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < 12 * 3600:
+        try:
+            return json.load(open(path, encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    try:
+        data = requests.get("https://openrouter.ai/api/v1/models", timeout=10).json().get("data", [])
+    except (requests.RequestException, ValueError):
+        return []
+    small = re.compile(r"(nano|mini|lite|[^\d][1-9](\.\d)?b\b)", re.I)  # skip tiny models
+    free = [m for m in data if str(m.get("id", "")).endswith(":free") and (m.get("context_length") or 0) >= min_ctx
+            and not small.search(m["id"])]
+    free.sort(key=lambda m: -(m.get("context_length") or 0))
+    ids = [m["id"] for m in free[:limit]]
+    try:
+        json.dump(ids, open(path, "w", encoding="utf-8"))
+    except OSError:
+        pass
+    return ids
+
+
 # ------------------------------------------------------------------ client
 class LLM:
     """LLM(role) builds its chain from env / defaults and the keys you have.
@@ -284,6 +311,12 @@ class LLM:
             prov, model = parse_entry(s, default_prov)
             label = f"{prov}:{model}"
             if label in entries:
+                continue
+            if label == "openrouter:auto-free":
+                if self._key("openrouter"):
+                    for mid in openrouter_free(cache_dir):
+                        if f"openrouter:{mid}" not in entries:
+                            entries.append(f"openrouter:{mid}")
                 continue
             if prov != "custom" and not self._key(prov):
                 self.skipped[label] = "no API key"
@@ -395,6 +428,9 @@ class LLM:
         if r.status_code == 200:
             try:
                 data = r.json()
+            except ValueError:  # e.g. a retired endpoint answering plain "OK"
+                return None, "gone", f"endpoint returned non-JSON: {txt[:60]!r}", None
+            try:
                 content = data["choices"][0]["message"]["content"]
                 if not content:
                     raise ValueError("empty content")
@@ -402,8 +438,10 @@ class LLM:
             except (ValueError, KeyError, IndexError, TypeError) as e:
                 return None, "bad_output", f"unusable response: {e}", None
         low = txt.lower()
+        if r.status_code == 400 and ("failed to validate json" in low or "json_validate_failed" in low):
+            return None, "no_json", "provider's JSON mode rejected the output; retrying without it", None
         ra = r.headers.get("retry-after")
-        m = re.search(r'"retryDelay":\s*"(\d+)s"', txt) or re.search(r"try again in ([\d.]+)s", low)
+        m = re.search(r'"retryDelay":\s*"([\d.]+)s"', txt) or re.search(r"try again in ([\d.]+)s", low)
         retry_s = float(ra) if ra and ra.replace(".", "").isdigit() else (float(m.group(1)) if m else None)
         if r.status_code in (401, 403):
             return None, "auth", f"HTTP {r.status_code}: key rejected", None
@@ -484,7 +522,8 @@ class LLM:
             elif kind == "no_json":
                 STATE.no_json.add(prov)
             elif kind == "daily":
-                STATE.cool_down(entry, retry_s if retry_s and retry_s > 600 else 6 * 3600, err)
+                # trust the provider's own retry hint when it gives one (Gemini does); else assume 6h
+                STATE.cool_down(entry, max(retry_s, 60) if retry_s else 6 * 3600, err)
             elif kind == "rate":
                 STATE.cool_down(entry, min(max(retry_s or 20, 5), 120), err)
             elif kind == "overload":

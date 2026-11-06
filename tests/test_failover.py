@@ -18,6 +18,7 @@ OK = lambda text: ({"choices": [{"message": {"content": text}}], "usage": {"prom
 @pytest.fixture(autouse=True)
 def fresh_state(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "STATE", L._State())
+    monkeypatch.setattr(L, "load_dotenv", lambda *a, **k: None)  # never read the developer's real .env
     for k in ("GEMINI_API_KEY", "LLM_API_KEY", "MISTRAL_API_KEY", "GROQ_API_KEY", "LLM_BASE_URL"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "g")
