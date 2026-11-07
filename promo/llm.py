@@ -278,24 +278,31 @@ class LLM:
     def __init__(self, role: str = "propose", chain: list[str] | None = None, keys: dict | None = None,
                  models: list[str] | None = None, base_url: str | None = None, api_key: str | None = None,
                  rpm: float | None = None, cache_dir: str | None = None, max_tokens: int = 16000,
-                 discover: bool = True, timeout: int | None = None, **_):
-        load_dotenv()
+                 discover: bool = True, timeout: int | None = None, use_env_keys: bool = True,
+                 state: "_State | None" = None, **_):
+        """use_env_keys=False: only keys passed in `keys` are used (never .env / host secrets / env vars).
+        state: cool-downs, bad-key flags and throttles; pass a fresh _State() per user so one person's
+        bad key or spent quota never blocks another user. Defaults to the process-wide STATE (CLI)."""
+        self.use_env_keys = use_env_keys
+        self.state = state if state is not None else STATE
+        if use_env_keys:
+            load_dotenv()
         self.role = role
         self.keys = dict(keys or {})
         self.max_tokens = max_tokens
         cache_dir = cache_dir or os.environ.get("LLM_CACHE_DIR", ".cache")
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
-        STATE.load(os.path.join(cache_dir, "model_state.json"))
+        self.state.load(os.path.join(cache_dir, "model_state.json"))
         self.extra = json.loads(os.environ.get("LLM_EXTRA", "{}"))
         self.patience = float(os.environ.get("LLM_PATIENCE", 4))      # max throttle wait before trying the next model
         self.max_wait = float(os.environ.get("LLM_MAX_WAIT", 120))    # max wait when EVERY model is cooling down
         self._custom = None
-        custom_url = base_url or os.environ.get("LLM_BASE_URL")
+        custom_url = base_url or (os.environ.get("LLM_BASE_URL") if use_env_keys else None)
         if custom_url:  # a single explicit OpenAI-compatible endpoint
             self._custom = Provider("custom", custom_url.rstrip("/"), (), float(rpm or os.environ.get("LLM_RPM", 30)),
                                     int(os.environ.get("LLM_MAX_INPUT", 120_000)), timeout or 150)
-            self.keys["custom"] = api_key or os.environ.get("LLM_API_KEY", "")
+            self.keys["custom"] = api_key or (os.environ.get("LLM_API_KEY", "") if use_env_keys else "")
         elif api_key:
             self.keys.setdefault("gemini", api_key)
         self.rpm_override = rpm
@@ -345,19 +352,24 @@ class LLM:
     @property
     def dead(self) -> dict:
         now = time.time()
-        return {e: STATE.cool[e][1] for e in self.entries if e in STATE.cool and STATE.cool[e][0] > now}
+        return {e: self.state.cool[e][1] for e in self.entries if e in self.state.cool and self.state.cool[e][0] > now}
 
     @property
     def model(self) -> str:
         now = time.time()
         for e in self.entries:
-            if STATE.cool.get(e, (0, ""))[0] <= now and e.split(":")[0] not in STATE.auth_bad:
+            if self.state.cool.get(e, (0, ""))[0] <= now and e.split(":")[0] not in self.state.auth_bad:
                 return e
         return self.entries[0] if self.entries else "none"
 
     def _key(self, prov: str) -> str | None:
         if prov == "custom":
             return self.keys.get("custom", "")
+        if not self.use_env_keys:
+            p = PROVIDERS.get(prov)
+            if p is not None and not p.needs_key:
+                return provider_key(prov)        # local Ollama: no secret involved
+            return self.keys.get(prov) or None
         return provider_key(prov, self.keys)
 
     def _prov(self, prov: str) -> Provider:
@@ -377,31 +389,31 @@ class LLM:
     # -- selection -----------------------------------------------------------
     def _fits(self, entry: str, need: int) -> bool:
         prov = entry.split(":", 1)[0]
-        return need <= min(self._prov(prov).max_input, STATE.max_fit.get(entry, 10 ** 9))
+        return need <= min(self._prov(prov).max_input, self.state.max_fit.get(entry, 10 ** 9))
 
     def _pick(self, need: int) -> tuple[str, float]:
         """Choose the entry to call now. Returns (entry, seconds to wait for its rate slot)."""
         while True:
             now = time.time()
-            fitting = [e for e in self.entries if e.split(":")[0] not in STATE.auth_bad and self._fits(e, need)]
+            fitting = [e for e in self.entries if e.split(":")[0] not in self.state.auth_bad and self._fits(e, need)]
             if not fitting:
-                if any(e.split(":")[0] not in STATE.auth_bad for e in self.entries):
+                if any(e.split(":")[0] not in self.state.auth_bad for e in self.entries):
                     raise NoModelFits(f"no available model accepts a ~{need}-token prompt for role '{self.role}'")
                 raise LLMError(f"no usable model for role '{self.role}' (keys rejected or none configured)")
-            ready = [e for e in fitting if STATE.cool.get(e, (0, ""))[0] <= now]
+            ready = [e for e in fitting if self.state.cool.get(e, (0, ""))[0] <= now]
             if not ready:
-                soonest = min(STATE.cool[e][0] for e in fitting)
+                soonest = min(self.state.cool[e][0] for e in fitting)
                 if soonest - now > self.max_wait:
-                    reasons = {e: STATE.cool[e][1][:80] for e in fitting}
+                    reasons = {e: self.state.cool[e][1][:80] for e in fitting}
                     raise LLMError(f"all models for role '{self.role}' are exhausted or cooling down: {reasons}")
                 time.sleep(max(0.5, soonest - now))
                 continue
-            with STATE.lock:
-                waits = [(e, max(0.0, STATE.next_slot.get(e, 0) - now)) for e in ready]
+            with self.state.lock:
+                waits = [(e, max(0.0, self.state.next_slot.get(e, 0) - now)) for e in ready]
                 choice = next(((e, w) for e, w in waits if w <= self.patience), None) or min(waits, key=lambda x: x[1])
                 e, w = choice
                 gap = 60.0 / max(self._prov(e.split(":")[0]).rpm, 0.1)
-                STATE.next_slot[e] = max(now, STATE.next_slot.get(e, 0)) + gap
+                self.state.next_slot[e] = max(now, self.state.next_slot.get(e, 0)) + gap
             return e, w
 
     # -- one HTTP attempt ------------------------------------------------------
@@ -410,7 +422,7 @@ class LLM:
         p = self._prov(prov)
         body = {"model": model, "temperature": temperature, "max_tokens": self.max_tokens,
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}], **self.extra}
-        if prov not in STATE.no_json:
+        if prov not in self.state.no_json:
             body["response_format"] = {"type": "json_object"}
         headers = {"Content-Type": "application/json"}
         key = self._key(prov)
@@ -503,7 +515,7 @@ class LLM:
                     json_fail[entry] = json_fail.get(entry, 0) + 1
                     last = f"{entry}: invalid JSON ({e})"
                     if json_fail[entry] >= 2:
-                        STATE.cool_down(entry, 600, "returned invalid JSON twice")
+                        self.state.cool_down(entry, 600, "returned invalid JSON twice")
                     continue
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump({"_model": entry, "out": out}, f, ensure_ascii=False)
@@ -513,27 +525,27 @@ class LLM:
             with self._slock:
                 self.stats["failovers"].append({"model": entry, "kind": kind, "reason": (err or "")[:160]})
             if kind == "auth":
-                STATE.auth_bad.add(prov)
+                self.state.auth_bad.add(prov)
             elif kind == "gone":
-                STATE.cool_down(entry, 24 * 3600, err)
+                self.state.cool_down(entry, 24 * 3600, err)
             elif kind == "too_large":
-                with STATE.lock:
-                    STATE.max_fit[entry] = min(STATE.max_fit.get(entry, 10 ** 9), int(need * 0.9))
+                with self.state.lock:
+                    self.state.max_fit[entry] = min(self.state.max_fit.get(entry, 10 ** 9), int(need * 0.9))
             elif kind == "no_json":
-                STATE.no_json.add(prov)
+                self.state.no_json.add(prov)
             elif kind == "daily":
                 # trust the provider's own retry hint when it gives one (Gemini does); else assume 6h
-                STATE.cool_down(entry, max(retry_s, 60) if retry_s else 6 * 3600, err)
+                self.state.cool_down(entry, max(retry_s, 60) if retry_s else 6 * 3600, err)
             elif kind == "rate":
-                STATE.cool_down(entry, min(max(retry_s or 20, 5), 120), err)
+                self.state.cool_down(entry, min(max(retry_s or 20, 5), 120), err)
             elif kind == "overload":
-                STATE.cool_down(entry, 90, err)
+                self.state.cool_down(entry, 90, err)
             elif kind == "timeout":
-                STATE.cool_down(entry, 300, err)
+                self.state.cool_down(entry, 300, err)
             elif kind in ("network", "bad_output"):
-                STATE.cool_down(entry, 30, err)
+                self.state.cool_down(entry, 30, err)
             else:  # bad_request: this entry can't serve this request shape; try others
-                STATE.cool_down(entry, 3600, err)
+                self.state.cool_down(entry, 3600, err)
         raise LLMError(f"gave up after {attempts} attempts for role '{self.role}'; last error: {last}")
 
     def chat_json(self, system: str, user: str, temperature: float = 0.2):

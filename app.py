@@ -1,16 +1,26 @@
 """Promo Finder: Streamlit front end.
 
 Two ways in:
-  1. Run: upload a show's episode screenplays (.txt files or one .zip), add an API key, run.
+  1. Run: upload a show's episode screenplays (.txt files or one .zip), add YOUR API key, run.
   2. View: upload a promos.json from an earlier run to browse it (no key needed).
 No show data is bundled with the app (the screenplays are confidential).
+
+Keys (bring your own):
+  * The app never uses the host's keys (.env, environment, Streamlit secrets). Each visitor pastes
+    their own. Local self-hosting can opt in with PROMO_ALLOW_SERVER_KEYS=1.
+  * A key lives only in this browser session's memory (st.session_state). It is sent only to that
+    provider over HTTPS, never written to disk, logs, outputs or cache, and "Forget my keys" clears it.
+  * Each session gets its own model state and response cache, so one visitor's bad key, spent quota or
+    uploaded scripts never affect or reach another visitor. Uploaded scripts are deleted after the run.
 """
 from __future__ import annotations
 
 import io
 import json
 import os
+import shutil
 import tempfile
+import uuid
 import zipfile
 
 import altair as alt
@@ -18,7 +28,7 @@ import pandas as pd
 import streamlit as st
 
 from promo import pipeline
-from promo.llm import LLM, PROVIDERS, LLMError, load_dotenv, provider_key
+from promo.llm import LLM, PROVIDERS, LLMError, _State, load_dotenv, provider_key
 from promo.parse import load_show
 
 st.set_page_config(page_title="Promo Finder", page_icon="🎬", layout="wide")
@@ -31,23 +41,45 @@ st.caption("Reads a microdrama's screenplays and proposes 20-60s promo clips: a 
            "a cliffhanger at the cut, understandable to a stranger. Every clip gets exact episode timestamps, "
            "an independent 'stranger' QA score and a posting order.")
 
+# ------------------------------------------------------------------ per-session isolation
+ALLOW_SERVER_KEYS = os.environ.get("PROMO_ALLOW_SERVER_KEYS") == "1"   # off by default: visitors bring keys
+if "sid" not in st.session_state:
+    st.session_state["sid"] = uuid.uuid4().hex
+    st.session_state["llm_state"] = _State()          # this visitor's cool-downs / bad-key flags only
+SESSION_CACHE = os.path.join(tempfile.gettempdir(), "promo_cache", st.session_state["sid"])
+os.makedirs(SESSION_CACHE, exist_ok=True)
+
+
+def make_llm(role, keys, chain=None):
+    return LLM(role, chain=chain, keys=keys, cache_dir=SESSION_CACHE, use_env_keys=ALLOW_SERVER_KEYS,
+               state=st.session_state["llm_state"])
+
+
 # ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.header("Models")
-    load_dotenv()
-    FREE = [p for p in ("gemini", "mistral", "openrouter", "groq", "cerebras", "github", "huggingface")]
+    st.header("Your API key")
+    if ALLOW_SERVER_KEYS:
+        load_dotenv()
+    FREE = [p for p in ("gemini", "openrouter", "groq", "mistral", "cerebras", "github", "huggingface")]
+    st.caption("Paste a key for at least one provider (free tiers work; Gemini or OpenRouter recommended). "
+               "Keys stay in this browser session's memory, go only to that provider, and are never saved.")
     keys = {}
-    with st.expander("API keys (any you have; empty = server's / skipped)", expanded=False):
+    for name in FREE:
+        server = ALLOW_SERVER_KEYS and bool(provider_key(name))
+        v = st.text_input(f"{name}" + ("  (server key available)" if server else ""), type="password",
+                          key=f"k_{name}", autocomplete="off",
+                          help=f"Free key: {PROVIDERS[name].signup}")
+        if v.strip():
+            keys[name] = v.strip()
+    if st.button("Forget my keys", help="Clears every key from this session"):
         for name in FREE:
-            server = bool(provider_key(name))
-            v = st.text_input(f"{name}" + ("  ✓ server key" if server else ""), type="password", key=f"k_{name}",
-                              help=f"Get a free key: {PROVIDERS[name].signup}. Used for this run only, never stored.")
-            if v:
-                keys[name] = v
-    # Server-side keys (env / host secrets) are used when a box is empty; they never reach the browser.
-    have = [n for n in FREE if keys.get(n) or provider_key(n)]
-    st.caption("Providers available: " + (", ".join(have) if have else "none, so only rules-only mode will work"))
-    roles = {r: LLM(r, keys=keys, cache_dir=os.path.join(tempfile.gettempdir(), "promo_cache")) for r in ("propose", "judge", "audit")}
+            st.session_state.pop(f"k_{name}", None)
+        st.session_state["llm_state"] = _State()
+        shutil.rmtree(SESSION_CACHE, ignore_errors=True)
+        st.rerun()
+    have = [n for n in FREE if keys.get(n) or (ALLOW_SERVER_KEYS and provider_key(n))]
+    st.caption("Providers ready: " + (", ".join(have) if have else "none yet (rules-only mode still works without a key)"))
+    roles = {r: make_llm(r, keys) for r in ("propose", "judge", "audit")}
     with st.expander("Fail-over chains (edit to reorder)"):
         gen_models = st.text_area("Generator", ",\n".join(roles["propose"].entries), height=110)
         judge_models = st.text_area("Blind judge", ",\n".join(roles["judge"].entries), height=110)
@@ -63,6 +95,14 @@ with st.sidebar:
                 "5. A show-aware auditor re-scores and rates spoilers\n6. Code ranks into tiers; LLM explains")
 
 tab_run, tab_view = st.tabs(["▶ Run on a show", "📂 View results"])
+
+
+def _redact(msg: str, keys: dict) -> str:
+    """Belt and braces: never echo a key back, even if a provider includes it in an error."""
+    for v in keys.values():
+        if v and len(v) > 6:
+            msg = msg.replace(v, v[:3] + "…redacted")
+    return msg
 
 
 def _extract(files) -> str:
@@ -105,13 +145,13 @@ with tab_run:
         llm = judge = auditor = None
         if mode.startswith("Full"):
             split = lambda s: [x.strip() for x in s.replace("\n", ",").split(",") if x.strip()]
-            cache = os.path.join(tempfile.gettempdir(), "promo_cache")
-            llm = LLM("propose", chain=split(gen_models), keys=keys, cache_dir=cache)
-            judge = LLM("judge", chain=split(judge_models), keys=keys, cache_dir=cache)
+            llm = make_llm("propose", keys, split(gen_models))
+            judge = make_llm("judge", keys, split(judge_models))
             if use_audit:
-                auditor = LLM("audit", chain=split(audit_models), keys=keys, cache_dir=cache)
+                auditor = make_llm("audit", keys, split(audit_models))
             if not llm.entries or not judge.entries:
-                st.error("No usable model: add at least one API key in the sidebar, or use the rules-only baseline.")
+                shutil.rmtree(data_dir, ignore_errors=True)
+                st.error("No usable model: paste your API key in the sidebar, or use the rules-only baseline.")
                 st.stop()
         with st.status("Running…", expanded=True) as status:
             try:
@@ -122,12 +162,17 @@ with tab_run:
                 status.update(label="Done", state="complete")
             except LLMError as e:
                 status.update(label="Model error", state="error")
-                st.error(str(e))
+                st.error(_redact(str(e), keys))
+                shutil.rmtree(data_dir, ignore_errors=True)
+                shutil.rmtree(out_dir, ignore_errors=True)
                 st.stop()
         st.session_state["rows"] = rows
         st.session_state["stats"] = json.load(open(os.path.join(out_dir, "run_stats.json"), encoding="utf-8"))
         st.session_state["report"] = open(os.path.join(out_dir, "report.md"), encoding="utf-8").read()
         st.session_state["csv"] = open(os.path.join(out_dir, "promos.csv"), encoding="utf-8-sig").read()
+        # the uploaded scripts are confidential: keep results in this session's memory, delete the files
+        shutil.rmtree(data_dir, ignore_errors=True)
+        shutil.rmtree(out_dir, ignore_errors=True)
 
 with tab_view:
     up = st.file_uploader("promos.json from an earlier run (optionally also run_stats.json)", type=["json"],
@@ -148,7 +193,7 @@ if rows:
     m = st.columns(5)
     m[0].metric("Valid clips", summ["clips"])
     m[1].metric("Acquisition-ready", (summ.get("by_tier") or {}).get("acquisition", summ["qualifying"]),
-                help="Hook ≥3 and cliffhanger ≥3 (of 5) and spoiler risk ≤3: safe to show strangers")
+                help="Hook and cliffhanger ≥3 of 5, a screenplay event within 3 seconds, and spoiler risk ≤3")
     m[2].metric("Episodes with a qualifying clip", summ["episodes_with_qualifying"])
     m[3].metric("Stitched / cross-episode", f"{summ['stitched']} / {summ['cross_episode']}")
     m[4].metric("Rejected by code checks", stats.get("n_rejected", "–"))
@@ -214,6 +259,17 @@ if rows:
                        f"{j.get('spoiler_risk')} · flag {j.get('content_flag')} — {j.get('verdict', '')}"
                        + (f"  ·  confusing: {j.get('confusing')}" if j.get("confusing") not in (None, "none") else "")
                        + (f"  ·  {r['repaired']}" if r.get("repaired") else ""))
+            ck = r.get("checks") or {}
+            if ck.get("hook_offset_s") is not None or ck.get("salient_beat_s") is not None:
+                ho = ck.get("hook_offset_s")
+                st.caption(("Code-measured hook lands at " + f"{ho:.1f}s" if ho is not None
+                            else f"No hook anchor; first salient beat at {ck.get('salient_beat_s')}s (heuristic)")
+                           + (f" · clip runs {ck['cliff_tail_s']:.1f}s past the cliffhanger"
+                              if ck.get("cliff_tail_s") is not None else ""))
+            if ck.get("hook_event_within_3s") is False:
+                st.warning("The hook lands after the first 3 seconds; consider starting later.")
+            if r.get("checks", {}).get("stitch_has_shared_speaker") is False:
+                st.warning("The stitched segments have no shared dialogue speaker; review whether the transition is clear to a new viewer.")
             a = r.get("audit") or {}
             if a:
                 st.caption(f"Show-aware auditor ({r.get('audit_model') or 'n/a'}): hook {a.get('hook')} · cliffhanger "

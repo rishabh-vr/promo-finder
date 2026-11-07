@@ -20,7 +20,7 @@ def _dialogue(blocks):
     return [b for b in blocks if b.kind == "dialogue"]
 
 
-def _score(ep: Episode, clip, episodes) -> tuple[float, str, str]:
+def _score(ep: Episode, clip, episodes) -> tuple[float, str, str, str | None, str | None]:
     seg = clip.segments[0]
     blocks = segment_blocks(ep, seg)
     dl = _dialogue(blocks)
@@ -48,7 +48,7 @@ def _score(ep: Episode, clip, episodes) -> tuple[float, str, str]:
     # being the very start of the episode is context-free-ish; being mid-scene is not
     if seg.start < 1.0:
         s += 0.5
-    return s, hook_txt, last
+    return s, hook_txt, last, (hook_blocks[0].id if hook_blocks else None), (dl[-1].id if dl else None)
 
 
 def propose(episodes_list: list[Episode], per_episode: int = 3, step_blocks: int = 1):
@@ -66,16 +66,16 @@ def propose(episodes_list: list[Episode], per_episode: int = 3, step_blocks: int
                 clip = build_clip(episodes, [{"episode": ep.ep, "start_block": a.id, "end_block": b.id}])
                 if not clip.valid:
                     continue
-                sc, hook, last = _score(ep, clip, episodes)
-                cands.append((sc, clip, hook, last))
+                sc, hook, last, hb, cb = _score(ep, clip, episodes)
+                cands.append((sc, clip, hook, last, hb, cb))
         cands.sort(key=lambda x: -x[0])
         picked = []
-        for sc, clip, hook, last in cands:
+        for sc, clip, hook, last, hb, cb in cands:
             if all(overlap_ratio(clip, p[1]) < 0.2 for p in picked):
-                picked.append((sc, clip, hook, last))
+                picked.append((sc, clip, hook, last, hb, cb))
             if len(picked) >= per_episode:
                 break
-        for sc, clip, hook, last in picked:
+        for sc, clip, hook, last, hb, cb in picked:
             seg = clip.segments[0]
             out.append(
                 {
@@ -84,7 +84,10 @@ def propose(episodes_list: list[Episode], per_episode: int = 3, step_blocks: int
                     "segments": [{"episode": ep.ep, "start_block": seg.first_block, "end_block": seg.last_block}],
                     "hook": hook,
                     "cliffhanger": last,
+                    "hook_block": hb,
+                    "cliff_block": cb,
                     "why": f"rule score {sc:.1f}",
+                    "rule_score": round(sc, 2),
                     "gen_hook_strength": None,
                     "gen_cliff_strength": None,
                 }

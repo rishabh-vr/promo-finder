@@ -29,6 +29,7 @@ RANK_TOP = 20
 DEDUPE_OVERLAP = 0.4
 MAX_PER_EPISODE_TOP10 = 2
 MIN_HOOK, MIN_CLIFF = 3, 3
+MAX_CLIFF_TAIL = 8.0   # seconds a clip may run on after its named cliffhanger block before it counts as resolved
 WORKERS = int(os.environ.get("PROMO_WORKERS", 4))  # parallel requests (each provider is rate-limited separately)
 
 
@@ -113,6 +114,7 @@ def propose_llm(eps: list[Episode], all_eps: list[Episode], llm: LLM, cb=None, c
                 cands.append({
                     "source": "llm", "episode": first_ep, "gen_model": model,
                     "segments": segs, "raw_segments": p.get("segments"),
+                    "hook_block": p.get("hook_block"), "cliff_block": p.get("cliff_block"),
                     "hook": p.get("hook", ""), "cliffhanger": p.get("cliffhanger", ""), "why": p.get("why", ""),
                     "gen_hook_strength": p.get("hook_strength"), "gen_cliff_strength": p.get("cliffhanger_strength"),
                     "context_needed": p.get("context_needed", ""),
@@ -235,9 +237,26 @@ def composite(c: dict) -> float | None:
 
 
 def qualifies(c: dict) -> bool:
-    """The brief's definition of a promo needs BOTH a hook and a cliffhanger."""
+    """Judged hook >= 3 and cliffhanger >= 3, plus the code-measured timing checks when available.
+
+    - hook: must land within 3s (named anchor if given, else the first salient beat).
+    - cliff: if the proposer named a cliffhanger block, it must be inside the clip and the clip must not
+      run more than MAX_CLIFF_TAIL seconds past it. If no cliff block was named (older saved runs, or a
+      fallback model that ignored the field) the timing is UNVERIFIED, not failed: the judged score
+      decides, and the row carries checks["cliff_anchor"] = "missing" so the UI can flag it.
+    """
     f = final_scores(c)
-    return bool(f) and f["hook"] >= MIN_HOOK and f["cliffhanger"] >= MIN_CLIFF
+    if not f or f["hook"] < MIN_HOOK or f["cliffhanger"] < MIN_CLIFF:
+        return False
+    checks = c.get("checks") or {}
+    if checks and not checks.get("hook_event_within_3s", True):
+        return False
+    if checks.get("cliff_anchor") == "outside clip":
+        return False
+    tail = checks.get("cliff_tail_s")
+    if tail is not None and tail > MAX_CLIFF_TAIL:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- stage 3b: audit
@@ -344,6 +363,7 @@ def _row(c: dict, episodes) -> dict:
                      for s in c["clip"].segments],
         "duration_s": round(c["clip"].duration, 1),
         "hook": c["hook"], "cliffhanger": c["cliffhanger"], "why": c["why"],
+        "hook_block": c.get("hook_block"), "cliff_block": c.get("cliff_block"),
         "context_needed": c.get("context_needed", ""), "repaired": c.get("repaired", ""),
         "score": c.get("score"),
         "gen_hook_strength": c.get("gen_hook_strength"), "gen_cliff_strength": c.get("gen_cliff_strength"),
@@ -372,9 +392,15 @@ def summarize(rows: list[dict]) -> dict:
         "episodes_with_qualifying": len({r["episode"] for r in q}),
         "stitched": sum(1 for r in rows if len(r["segments"]) > 1),
         "cross_episode": sum(1 for r in rows if len({s["episode"] for s in r["segments"]}) > 1),
+        "stitch_no_shared_speaker": sum(
+            1 for r in rows if (r.get("checks") or {}).get("stitch_has_shared_speaker") is False
+        ),
         "repaired": sum(1 for r in rows if r["repaired"]),
         "content_flagged": sum(1 for r in judged if r["judge"].get("content_flag", "none") not in ("none", None)),
         "first_beat_late": sum(1 for r in rows if (r["checks"].get("first_beat_s") or 0) > 3),
+        "hook_anchored": sum(1 for r in rows if r["checks"].get("hook_offset_s") is not None),
+        "hook_late": sum(1 for r in rows if r["checks"].get("hook_event_within_3s") is False),
+        "cliff_lingers": sum(1 for r in rows if (r["checks"].get("cliff_tail_s") or 0) > MAX_CLIFF_TAIL),
         "ends_at_episode_end": sum(1 for r in rows if r["checks"].get("ends_at_episode_end")),
         "generator_overconfidence_cliff": avg([g - j for g, j in gen_c]),  # gen score /2 vs judge (both ~1-5)
         "judge_vs_audit": agreement(rows),
@@ -467,19 +493,45 @@ def _reasons(rej):
 
 def _write_report(out_dir, rows, stats):
     s = stats["summary"]
-    models = {n: v["stats"].get("by_model") for n, v in (stats.get("llm") or {}).items()}
+    model_fields = {"propose": "gen_model", "judge": "judge_model", "audit": "audit_model"}
+    models = {role: sorted({str(r[field]) for r in rows if r.get(field)})
+              for role, field in model_fields.items()}
+    models = {role: names for role, names in models.items() if names}
+    cache_hits = sum(v.get("stats", {}).get("cache_hits", 0)
+                     for v in (stats.get("llm") or {}).values())
+    runtime = f"run {stats.get('elapsed_s')}s"
+    if cache_hits:
+        runtime += f" ({cache_hits} cached responses; not a fresh-run latency measurement)"
+    judged = [r for r in rows if r.get("judge")]
+    blind_score_qualifying = sum(
+        float(r["judge"].get("hook", 0)) >= MIN_HOOK
+        and float(r["judge"].get("cliffhanger", 0)) >= MIN_CLIFF
+        for r in judged
+    )
+    has_audit = any(r.get("audit") for r in rows)
+    score_basis = "blind judge plus show-aware audit where available" if has_audit else "blind judge"
+    score_basis += " and a code-checked event within the first 3 seconds"
+    n_findings = sum(stats.get("rejection_reasons", {}).values())
     L = [f"# Promo shortlist: {stats.get('show', '')}", "",
-         f"Mode **{stats.get('mode')}** · models used {models or 'none (rules only)'} · "
-         f"run {stats.get('elapsed_s')}s", "",
-         f"- {stats['n_raw_candidates']} proposals → {stats['n_ranked']} valid clips, {stats['n_rejected']} rejected "
-         f"by code checks {stats['rejection_reasons']}",
-         f"- {s['qualifying']}/{s['judged']} clips **qualify** (stranger-judge hook ≥{MIN_HOOK} and cliffhanger ≥{MIN_CLIFF}); "
-         f"covering {s['episodes_with_qualifying']} episodes. Tiers: {s['by_tier']}",
-         f"- {s['stitched']} stitched clips ({s['cross_episode']} cross-episode), {s['repaired']} auto-trimmed to fit 60s, "
+         f"Mode **{stats.get('mode')}** · models used {models or 'none (rules only)'} · {runtime}", "",
+         f"- {stats['n_raw_candidates']} proposals → {stats['n_ranked']} valid clips; "
+         f"{stats['n_rejected']} candidate(s) rejected with {n_findings} validation finding(s): "
+         f"{stats['rejection_reasons']}",
+         f"- {s['qualifying']}/{s['judged']} clips **qualify** by {score_basis} "
+         f"(hook ≥{MIN_HOOK} and cliffhanger ≥{MIN_CLIFF}); covering "
+         f"{s['episodes_with_qualifying']} episodes. Tiers: {s['by_tier']}",
+         f"- {s['stitched']} stitched clips ({s['cross_episode']} cross-episode); "
+         f"{s['stitch_no_shared_speaker']} lack a shared dialogue speaker and need continuity review; "
+         f"{s['repaired']} auto-trimmed to fit 60s, "
          f"{s['content_flagged']} carry a content flag",
          f"- Avg blind-judge scores (1-5): {s['avg_judge']}",
          f"- Blind judge vs show-aware auditor: {s.get('judge_vs_audit')}", "",
          "Timestamps are relative to the start of each episode (mm:ss.s). Ranked = order to post.", ""]
+    if judged:
+        L.insert(7, f"- Blind-judge score threshold alone: {blind_score_qualifying}/{len(judged)} pass before the "
+                    f"code timing checks; hook anchors measured for {s.get('hook_anchored', 0)} clips, "
+                    f"{s.get('hook_late', 0)} land after 3s, {s.get('cliff_lingers', 0)} run >{MAX_CLIFF_TAIL:.0f}s "
+                    f"past the cliffhanger.")
     for r in rows[:RANK_TOP]:
         seg = "  +  ".join(f"**E{x['episode']} {x['start']} → {x['end']}**" for x in r["segments"])
         j = r["judge"]
@@ -523,7 +575,7 @@ def run(data_dir: str, out_dir: str, mode: str = "llm", llm: LLM | None = None, 
     kept, rejected = validate(raw, episodes)
     _log(cb, f"[validate] {len(raw)} proposals -> kept {len(kept)}, rejected {len(rejected)}")
     for c in kept:
-        c["checks"] = code_checks(episodes, c["clip"])
+        c["checks"] = code_checks(episodes, c["clip"], c.get("hook_block"), c.get("cliff_block"))
 
     if judge_llm is not None:
         errors += judge(kept, episodes, judge_llm, cb)
@@ -533,7 +585,16 @@ def run(data_dir: str, out_dir: str, mode: str = "llm", llm: LLM | None = None, 
         c["score"] = composite(c)
     errors += rank(kept, judge_llm, cb) if judge_llm is not None else []  # rationale text is low-stakes: cheap model
     if judge_llm is None:
-        for i, c in enumerate(kept):
+        # no judge: rank by the rule score (same per-episode cap), not by position in the show
+        pool = sorted(kept, key=lambda c: (-(c.get("rule_score") or 0), c["episode"]))
+        ordered, deferred, per_ep = [], [], {}
+        for c in pool:
+            if len(ordered) < 10 and per_ep.get(c["episode"], 0) >= MAX_PER_EPISODE_TOP10:
+                deferred.append(c)
+                continue
+            ordered.append(c)
+            per_ep[c["episode"]] = per_ep.get(c["episode"], 0) + 1
+        for i, c in enumerate(ordered + deferred):
             c["rank"] = i + 1
     meta = {"show": show_name or os.path.basename(os.path.normpath(data_dir)), "mode": mode,
             "n_episodes": len(eps_run), "n_raw_candidates": len(raw), "elapsed_s": round(time.time() - t0)}
@@ -554,7 +615,7 @@ def compare_baseline(data_dir: str, out_dir: str, judge_llm: LLM, per_episode: i
         c["id"] = f"R{i + 1:03d}"
     kept, rejected = validate(raw, episodes)
     for c in kept:
-        c["checks"] = code_checks(episodes, c["clip"])
+        c["checks"] = code_checks(episodes, c["clip"], c.get("hook_block"), c.get("cliff_block"))
     errors = judge(kept, episodes, judge_llm, cb, label="judge-baseline")
     for c in kept:
         c["score"] = composite(c)

@@ -26,21 +26,35 @@ must be 20-60 seconds; the system may widen each cut by a second or two so no li
 AIM FOR 25-52 SECONDS in total. Estimate it from the timestamps shown.
 
 RULES
-- Quality over quantity. For EACH episode in the transcripts return 0-3 promos, best first. Most episodes \
-have 1-2 great moments; return none for an episode with nothing promo-worthy. Never pad.
+- For EACH episode in the transcripts, inspect for up to 3 distinct promo moments and return them best first. \
+When an episode contains at least 2 genuinely strong moments, return 2 rather than stopping after the first. \
+Return 1 or none when fewer qualify; never pad or duplicate a beat just to meet a count.
 - Do NOT just slice an episode into consecutive chunks. Each promo must be built around one specific \
 hook and one specific cliffhanger.
-- start_block of the first segment = the block where the hook happens (or the minimum set-up it needs).
+- start_block of the first segment = the block where the hook happens (or the minimum set-up it needs). \
+The hook itself must be visible or audible in the first 3 seconds, not merely arrive later in the clip.
 - end_block of the last segment = the last block BEFORE the question is answered.
+- A character deciding or promising to act is usually a resolved decision, not an open cliffhanger. \
+Prefer a threat, unanswered question, interrupted action, or reveal that cuts before its answer.
 - Use a multi-segment ("stitched") promo only when it is clearly better than any single stretch, e.g. \
 a hook line from one scene + the cliffhanger from a later scene, or set-up in one episode and the \
-cliffhanger in the next. Each segment should be at least 4 seconds. Segments must not overlap.
+cliffhanger in the next. Each segment should be at least 4 seconds. Segments must not overlap. Every \
+cut must remain understandable to a first-time viewer: prefer the same character or an explicit causal \
+link across the cut. If the second segment introduces an unrelated character or conflict, use one \
+continuous segment instead.
 - Prefer moments a new viewer can follow. Avoid giving away the show's biggest late twists.
 - Self-scores are 1-10 and must be honest; most clips are not 9s.
 
+- ANCHORS: also name "hook_block" = the single block where the scroll-stopping moment lands (the slap, \
+the line, the reveal) and "cliff_block" = the block carrying the unresolved moment. The system MEASURES \
+how many seconds into the clip hook_block starts and how long the clip runs after cliff_block ends; a \
+hook landing after 3 seconds, or a clip lingering after its cliffhanger, is demoted. Choose start and end \
+blocks so the hook is within 3s and the cut comes right after the cliffhanger.
+
 Respond with JSON only, exactly:
 {"promos": [{"segments": [{"start_block": "E5-B012", "end_block": "E5-B040"}], \
-"hook": "<what happens in the first 3 seconds, quoting the line if any>", \
+"hook_block": "E5-B013", "cliff_block": "E5-B039", \
+"hook":"<what happens in the first 3 seconds, quoting the line if any>", \
 "cliffhanger": "<what is left unresolved at the final cut>", \
 "why": "<one line: why this works as a promo>", \
 "hook_strength": <1-10>, "cliffhanger_strength": <1-10>, \
@@ -65,13 +79,17 @@ from the start of the clip; "[CUT TO ...]" marks a jump to another moment.
 
 Score 1-5 (5 = excellent, 1 = fails). Be strict; most clips are 2-4:
 - hook: does something in the FIRST 3 SECONDS make a scroller stop (slap, reveal, shocking line, threat, \
-humiliation)? Establishing shots, small talk or slow set-up in the first 3s = 1-2.
+humiliation)? Establishing shots, small talk or slow set-up in the first 3s = 1-2. If the first striking \
+event arrives after 3 seconds, score 1-2 even if the later payoff is strong.
 - cliffhanger: does the clip END on an unresolved moment that makes you need the next part? Ending on a \
 resolved beat, a character calming down or deciding something, a pause, a reaction shot, or \
 mid-explanation = 1-2. Only a genuinely open question, threat, reveal or interrupted action earns 4-5. \
-Ignore script wording that merely SAYS 'dramatic' or 'tense'; judge what actually happens.
+For example, a character choosing to accept a task resolves that choice; a door beginning to open before \
+we see who is there leaves a question open. Ignore script wording that merely SAYS 'dramatic' or 'tense'; \
+judge what actually happens.
 - standalone: from the clip alone, can a stranger tell who the main people are, what the conflict is and \
-what is at stake? Unexplained names or references to unseen events lower the score.
+what is at stake? Unexplained names or references to unseen events lower the score. For stitched clips, \
+also judge whether the transition introduces an ungrounded character or a different conflict.
 - spoiler_risk: 1 = harmless teaser, 5 = gives away a major twist or resolution.
 Also give: "confusing": what a stranger would not understand ("none" if nothing); "content_flag": one of \
 "none", "sexual", "violence", "both" (only for explicit sexual content or graphic violence that would \
@@ -114,10 +132,14 @@ KNOW THE WHOLE SHOW: you get its story bible (one logline per episode). You audi
 (plain script text; [mm:ss] from the start of the clip; "[CUT TO ...]" marks a jump).
 
 Score each clip 1-5, strictly (use the full range; reserve 5 for clips you would post today):
-- hook: would the FIRST 3 SECONDS stop a stranger mid-scroll? (slow set-up, establishing shot = 1-2)
+- hook: would the FIRST 3 SECONDS stop a stranger mid-scroll? (slow set-up, establishing shot, or first \
+striking event after 3 seconds = 1-2)
 - cliffhanger: does it end on a genuinely open question/threat/reveal/interrupted action, cut BEFORE the \
-answer? (resolved beat, calm reaction, decision made, pause = 1-2)
+answer? (resolved beat, calm reaction, decision made, pause = 1-2). A decision to act closes that choice; \
+an interrupted action or unanswered threat can remain open.
 - standalone: could a stranger who never saw the show follow who/what/stakes from the clip alone?
+- For stitched clips, score standalone lower when a cut jumps to unintroduced people or an unrelated \
+conflict without a clear character or causal link.
 - spoiler_risk: USING THE STORY BIBLE, how much does this clip give away? 1 = early premise or a \
 mid-story tease; 3 = reveals a mid-series turn; 5 = reveals a major twist, the villain's downfall, an \
 identity reveal or an ending. A clip can be gripping AND a big spoiler; score them separately.

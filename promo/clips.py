@@ -165,26 +165,92 @@ def clip_text(episodes: dict[int, Episode], clip: Clip, with_times: bool = False
     return "\n".join(parts)
 
 
-def code_checks(episodes: dict[int, Episode], clip: Clip) -> dict:
-    """Cheap deterministic signals, independent of any model:
-    first_beat_s : seconds until the first line/action/sound (a hook needs one inside 3s)
-    hook_has_line: a line of dialogue starts inside the first 3s
+_IMPACT = re.compile(
+    r"\b(slap|strike|struck|punch|hit|crash|shatter|smash|slam|grab|seize|shove|push|kiss|collaps|faint|"
+    r"scream|shriek|gasp|burst|kick|stab|shoot|shot|gun|knife|blade|blood|bleed|fall|fell|throw|threw|"
+    r"rip|tear|tore|choke|explod|fire|flame|kneel|reveal|unmask|pours?|spill|drag|yank|snatch)\w*", re.I)
+
+
+def is_salient(b: Block) -> bool:
+    """A beat a scroller can notice: a spoken line, a sound, or an action with a physical impact verb.
+    Camera moves and quiet actions ('she sits on the bed', 'he stirs the tea') are not hooks."""
+    return b.kind in ("dialogue", "sound") or (b.kind == "action" and bool(_IMPACT.search(b.text)))
+
+
+def resolve_block(episodes: dict[int, Episode], ref, default_ep: int | None) -> Block | None:
+    """'E5-B012' or 'B012' (+ default episode) -> Block, or None."""
+    if not ref:
+        return None
+    spec = normalize_spec({"episode": default_ep, "start_block": str(ref), "end_block": str(ref)})
+    try:
+        return episodes[int(spec["episode"])].block(spec["start_block"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def clip_time(clip: Clip, b: Block, edge: str = "start") -> float | None:
+    """Seconds from the start of the CLIP to a block's start (or end), across stitched segments."""
+    offset = 0.0
+    t = b.start if edge == "start" else b.end
+    for s in clip.segments:
+        if s.ep == b.ep and s.start - EPS <= t <= s.end + EPS:
+            return round(offset + t - s.start, 2)
+        offset += s.dur
+    return None
+
+
+def code_checks(episodes: dict[int, Episode], clip: Clip, hook_block=None, cliff_block=None) -> dict:
+    """Cheap deterministic signals, independent of any model's opinion:
+    first_beat_s     : seconds until the first non-camera block (legacy; any quiet action counts)
+    salient_beat_s   : seconds until the first line, sound or impact action (heuristic hook timing)
+    hook_offset_s    : seconds until the block the proposer NAMED as the hook (measured, not claimed)
+    cliff_tail_s     : seconds the clip runs on after the block named as the cliffhanger ends; a long
+                       tail means the cut lingers into the answer
+    hook_event_within_3s: hook_offset_s <= 3 when the anchor is known, else salient_beat_s <= 3
     ends_at_episode_end: the cut is the episode's own ending (usually a written cliffhanger)
-    last_line    : the final line of dialogue in the clip"""
+    stitch_*         : whether consecutive segments share a speaking character (continuity proxy)"""
     first = clip.segments[0]
     blocks = segment_blocks(episodes[first.ep], first)
     beats = [b.start - first.start for b in blocks if b.kind != "camera"]
+    salient = [max(0.0, b.start - first.start) for b in blocks if is_salient(b)]
     lines = [b for b in blocks if b.kind == "dialogue"]
     last = clip.segments[-1]
     last_blocks = segment_blocks(episodes[last.ep], last)
     last_lines = [b for b in last_blocks if b.kind == "dialogue"]
+    segment_speakers = [
+        {b.speaker.strip().casefold() for b in part if b.kind == "dialogue" and b.speaker.strip()}
+        for _, part in clip_blocks(episodes, clip)
+    ]
+    speaker_links = [sorted(segment_speakers[i] & segment_speakers[i + 1])
+                     for i in range(len(segment_speakers) - 1)]
+    hb = resolve_block(episodes, hook_block, first.ep)
+    cb = resolve_block(episodes, cliff_block, last.ep)
+    hook_offset = clip_time(clip, hb, "start") if hb else None
+    cliff_at = clip_time(clip, cb, "end") if cb else None
+    salient_s = round(min(salient), 1) if salient else None
+    if hook_offset is not None:
+        hook_ok = hook_offset <= HOOK_WINDOW
+    elif hb is not None:          # the named hook is not even inside the clip
+        hook_ok = False
+    else:
+        hook_ok = salient_s is not None and salient_s <= HOOK_WINDOW
     return {
         "first_beat_s": round(min(beats), 1) if beats else None,
+        "salient_beat_s": salient_s,
+        "hook_offset_s": hook_offset,
+        "hook_anchor": ("measured" if hook_offset is not None
+                        else "outside clip" if hb else "none (heuristic)"),
+        "cliff_tail_s": round(clip.duration - cliff_at, 2) if cliff_at is not None else None,
+        "cliff_anchor": ("measured" if cliff_at is not None
+                         else "outside clip" if cb else "missing"),
+        "hook_event_within_3s": hook_ok,
         "hook_has_line": any(b.start - first.start < HOOK_WINDOW for b in lines),
         "ends_at_episode_end": abs(last.end - episodes[last.ep].duration) < 0.6,
         "last_line": (f'{last_lines[-1].speaker}: "{last_lines[-1].text}"' if last_lines else ""),
         "n_segments": len(clip.segments),
         "cross_episode": len({s.ep for s in clip.segments}) > 1,
+        "stitch_speaker_links": speaker_links,
+        "stitch_has_shared_speaker": all(bool(link) for link in speaker_links) if speaker_links else None,
     }
 
 
