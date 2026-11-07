@@ -7,7 +7,7 @@ cliffhanger, one line on why it works, a blind model QA score, and the order to 
 
 Built for the Kuku AI Generalist assignment (Problem 1).
 
-**Live app:** https://promo-finder.streamlit.app/ (paste your own free API key in the sidebar, or use rules-only mode without a key).
+**Live app:** https://promo-finder.streamlit.app/ (paste one API key in the sidebar; the provider is detected from the key, so Gemini, OpenRouter, Groq and others all work. Or use rules-only mode without a key).
 
 ## Quick start
 
@@ -177,14 +177,16 @@ uncached run is recorded.
 
 1. Push this repo to GitHub.
 2. On share.streamlit.io choose **New app**, pick the repo, and set the main file to `app.py`.
-3. **Do not add API keys to Secrets.** Each visitor pastes **their own** free key in the sidebar.
+3. **Do not add API keys to Secrets.** Each visitor pastes **their own** key into the single API-key field.
+   The provider is auto-detected from the key prefix (`AIza…` Gemini, `sk-or-…` OpenRouter, `gsk_…` Groq,
+   `csk-…` Cerebras, `hf_…` Hugging Face, `ghp_…`/`github_pat_…` GitHub) or picked from the dropdown (e.g. Mistral).
 
 How keys are handled in the app (`app.py`, tested in `tests/test_keys.py`):
 - The host's keys (`.env`, environment variables, Streamlit secrets) are **never used**. Only for
   self-hosting on your own machine can you opt in with `PROMO_ALLOW_SERVER_KEYS=1`.
 - A pasted key stays in that visitor's session memory only. It is sent only to the chosen provider over
   HTTPS and is never written to disk, logs, outputs or the cache. It is redacted from error messages.
-  **Forget my keys** clears it.
+  **Forget key** clears it.
 - Every visitor gets an isolated model state and response cache, so one person's bad key or spent quota
   can't block another, and nobody sees another visitor's results. Uploaded scripts are deleted after
   each run.
