@@ -7,6 +7,8 @@ cliffhanger, one line on why it works, a blind model QA score, and the order to 
 
 Built for the Kuku AI Generalist assignment (Problem 1).
 
+**Live app:** https://promo-finder.streamlit.app/ (paste your own free API key in the sidebar, or use rules-only mode without a key).
+
 ## Quick start
 
 ```bash
